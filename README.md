@@ -1,7 +1,7 @@
 # ProVest FM Admin Tool
 
 Internal web app for viewing and editing the five SQL Server tables that configure the
-ProVest importer. Development database, **authentication disabled**, prototype scope.
+ProVest importer. Development database, prototype scope.
 
 Design: [docs/ProVest-Admin-Design.md](docs/ProVest-Admin-Design.md)
 
@@ -9,15 +9,13 @@ Design: [docs/ProVest-Admin-Design.md](docs/ProVest-Admin-Design.md)
 React + TypeScript (Vite)  ->  ASP.NET Core 8 Web API  ->  Services  ->  parameterised queries  ->  SQL Server
 ```
 
-Phase 1 runs on inline queries. **Nothing needs to be deployed to the database to run this** —
-point it at a connection string and go. The stored procedures that replace those queries in
-phase 2 are written and parked; see [db/phase2-stored-procedures/](db/phase2-stored-procedures/)
-for what moving over buys you.
+All SQL lives in the service layer as parameterised inline queries. **Nothing needs to be
+deployed to the database to run this** — point it at a connection string and go. There is no
+schema change, no migration, and no database object owned by this project.
 
 ## Layout
 
 ```
-db/phase2-stored-procedures/  25 procedures + _deploy.sql -- NOT deployed, not called
 src/ProVest.Admin.Api/        ASP.NET Core 8, Dapper, controllers
 src/provest-admin-web/        React 19 + TypeScript + Vite + MUI
 docs/                         design document
@@ -34,6 +32,10 @@ docs/                         design document
 | `ImportFileHeader` | full CRUD; hard delete, guarded |
 
 `ProVestStandardColumn` and `ProjectSetup` are read for dropdowns only.
+
+All five tables hard-delete. `IsActive` stays an editable column on the client forms because the
+importer reads it, but it is not a delete flag — "the importer should skip this" and "this record
+should not exist" are different statements and the tool keeps them separate.
 
 ## Things worth knowing before you edit anything
 
@@ -55,12 +57,11 @@ No foreign key enforces it, so a wrong number here fails silently and only shows
 `ImporterIdNotFound` in `ProVestErrorLog`. The UI labels it "Location Id" throughout.
 
 **`Import_Update` and `ImportFileHeader` have no primary key.** `id` is a nullable `int` with no
-identity and no unique constraint. Every write procedure checks that exactly one row matches
-before touching anything, and rows whose `id` is null or duplicated show in the grid greyed out
-with edit and delete disabled — they cannot be addressed, so the tool refuses rather than
-guessing.
+identity and no unique constraint. Every write checks that exactly one row matches before
+touching anything, and rows whose `id` is null or duplicated show in the grid greyed out with
+edit and delete disabled — they cannot be addressed, so the tool refuses rather than guessing.
 
-**Comparisons are case-insensitive.** The database collation is CI and no procedure contains a
+**Comparisons are case-insensitive.** The database collation is CI and no query contains a
 `COLLATE` clause, so searching `smith` matches `SMITH`. The application never changes the case of
 anything it stores or displays.
 
@@ -118,8 +119,8 @@ No database name is hardcoded anywhere in the app and every query uses two-part 
 connection string alone decides what the tool reads and writes. Point it carefully.
 
 The account needs `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the five tables, plus `SELECT` on
-`ProVestStandardColumn`, `ProjectSetup` and `Project` for the dropdowns. That is broader than it
-will be after phase 2 — see [Security](#security).
+`ProVestStandardColumn`, `ProjectSetup` and `Project` for the dropdowns. See
+[Security](#security) for what that implies.
 
 ### 2. Run
 
@@ -155,15 +156,21 @@ ngrok http 5173
 `dev:tunnel` passes `--mode tunnel`, which turns on the host allow-list and the `wss` HMR
 settings the tunnel needs. Plain `npm run dev` leaves those off, because they break local HMR.
 
-**The tunnel is a public URL, authentication is disabled, and every write endpoint is live
-against the database the connection string names.** Anyone with the link can create, edit and
-delete. Bring it up for the review and take it down afterwards.
+**The tunnel is a public URL, the only thing in front of it is a shared plaintext password list,
+and every write endpoint is live against the database the connection string names.** Anyone who
+gets past the sign-in page can create, edit and delete. Bring it up for the review and take it
+down afterwards.
 
 ## Security
 
-Authentication is off, and in phase 1 the application code is the **only** thing constraining
-what reaches the database. Everything below lives in `Services/ServiceBase.cs` and the per-table
-services:
+Sign-in is a cookie session applied as an authorization **fallback policy**, so a newly added
+controller is protected by default rather than by someone remembering an attribute. Only
+`/api/auth/login` and `/api/auth/me` opt out with `[AllowAnonymous]`; `me` returns 401 rather
+than redirecting, so the client can probe for a session on load. There is deliberately no
+authorization *policy* beyond that — every signed-in user can do everything.
+
+Beyond the sign-in gate, the application code is the **only** thing constraining what reaches
+the database. Everything below lives in `Services/ServiceBase.cs` and the per-table services:
 
 - Every value is a Dapper parameter; nothing caller-supplied is concatenated into SQL.
 - `ORDER BY` cannot be parameterised, so a sort request is used only as a key into a fixed
@@ -172,10 +179,11 @@ services:
 - `LIKE` metacharacters are escaped, so a `%` typed into a search box is a literal `%`.
 - Routes are fixed per table; no table or column name is ever accepted from the client.
 
-What phase 1 gives up: the original design had the app account hold `EXECUTE` on 25 stored
-procedures and **no table rights**, so a bug in the API could not become a bug against the
-tables. Inline queries need table-level permissions, so that backstop is gone until phase 2.
-Worth weighing before this points at anything but a dev database.
+Because the queries are inline, the application account holds `SELECT`/`INSERT`/`UPDATE`/`DELETE`
+on the five tables directly, which means a bug in the API is a bug against the tables. Moving
+that enforcement into the database — `GRANT EXECUTE` on stored procedures and no table rights —
+is the one control that cannot be expressed in C#. It is not built, and it is the thing to ask
+for first if this ever needs to point at anything other than a dev database.
 
 ## Verification checklist
 
@@ -197,10 +205,11 @@ Then the error paths, which are the parts worth deliberately provoking:
 ## Notes
 
 **Auditing** is Serilog only, to `src/ProVest.Admin.Api/logs/`. Every write logs the table,
-operation, id, and the before and after images. No audit table, no schema change.
+operation, id, signed-in username, and the before and after images. No audit table, no schema
+change.
 
 **Performance.** Paging, filtering and sorting are all server-side; the browser never holds more
-than one page. Page size is capped at 100 inside the procedures, not just in the controller.
+than one page. Page size is capped at 100 in the service, not just the controller.
 `Import_Update` and `ImportFileHeader` are unindexed heaps, so every query against them —
 including the uniqueness check on each write — is a full scan. That is fine at current volume;
 if it stops being fine, four nonclustered indexes on `(id)` and `(client_id)` are the fix.
@@ -211,8 +220,6 @@ if it stops being fine, four nonclustered indexes on `(id)` and `(client_id)` ar
 statements in the UAT migration script, so the layers cannot drift apart. If those tables ever
 change, regenerate rather than hand-editing.
 
-**Phase 2.** Move the queries into the parked stored procedures and narrow the app account to
-`EXECUTE`-only. See [db/phase2-stored-procedures/README.md](db/phase2-stored-procedures/README.md).
-
 **Not built:** bulk edit, file/CSV import, CSV export, clone-an-importer, integrity reporting,
-and any authorization layer. See §10 of the design document.
+stored procedures with `EXECUTE`-only permissions, and any authorization layer. See §10 of the
+design document.

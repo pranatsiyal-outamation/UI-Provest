@@ -1,25 +1,26 @@
 # ProVest FM Admin Tool — Design
 
-Internal web app to view and edit 5 SQL Server tables. Dev database, auth disabled, prototype scope.
+Internal web app to view and edit 5 SQL Server tables. Dev database, cookie sign-in, prototype scope.
 
 **Architecture:** React + TypeScript (Vite) → ASP.NET Core 8 Web API → Services → parameterised queries → SQL Server → IIS.
 
-**Phase 1 uses inline queries, not stored procedures.** Procedures were the original plan
-and are written and kept in [`db/phase2-stored-procedures/`](../db/phase2-stored-procedures/),
-but deploying them is a schema write, and phase 1 needed to be testable without one. §4 covers
-what that means, and §8 covers what it costs.
+**All SQL is inline in the service layer, not in stored procedures.** Procedures were the
+original plan, but deploying them is a schema write and this needed to be testable without one.
+They were written, never deployed and never called, and have since been removed; if
+database-enforced access control becomes a requirement they return as new work. §4 covers how
+data access works, §8 covers what the inline approach costs.
 
 ---
 
 ## 1. Facts that shape the design
 
-**Collation is case-insensitive.** `sqlproj` declares `ModelCollation 1033, CI`, no `COLLATE` clause exists in the DB project, and the importer compares with `OrdinalIgnoreCase`. Searching `smith` matches `SMITH`. No SP contains a `COLLATE` clause — comparisons inherit the DB collation. The app never applies `UPPER`/`LOWER`/`ToUpperInvariant`; values are stored and returned exactly as entered.
+**Collation is case-insensitive.** `sqlproj` declares `ModelCollation 1033, CI`, no `COLLATE` clause exists in the DB project, and the importer compares with `OrdinalIgnoreCase`. Searching `smith` matches `SMITH`. No query contains a `COLLATE` clause — comparisons inherit the DB collation. The app never applies `UPPER`/`LOWER`/`ToUpperInvariant`; values are stored and returned exactly as entered.
 
 **`ProVestColumnMapping` is generated from `Import_Update`.** `OQMS.Database/Scripts/Add_ProVestClientMapping_Data.sql` does `DELETE FROM ProVestColumnMapping; INSERT … SELECT FROM Import_Update`. So `ProVestColumnMapping.ImporterId` **is** `Import_Update.id`, and `ColumnName` **is** a client header copied out of an `Import_Update` cell. Edits to `ProVestColumnMapping` are wiped when that script runs.
 → **`ProVestColumnMapping` is read-only here.** `Import_Update` is the source of truth, with an explicit per-importer regenerate action.
 
 **`Import_Update` and `ImportFileHeader` have no PK, no unique constraint, no identity.** `id` is a nullable int. Nothing guarantees a single row is addressable, and no schema changes are in scope.
-→ Every write SP carries a runtime uniqueness guard. Rows with null or duplicate `id` are shown read-only.
+→ Every write carries a runtime uniqueness guard. Rows with null or duplicate `id` are shown read-only.
 
 **`client_id` on the import tables is not `ProVestClient.Id`.** Traced through `FMService.cs:1544`: `GetClientIdForRecord()` returns `ProVestClientLocation.LocationId`, which is matched against `ImportFileHeader.client_id`.
 
@@ -42,7 +43,7 @@ No FK enforces it. → **The UI labels this "Location Id", never "Client".**
 
 **Schema traps:** `[3rdparty_filenumber]` starts with a digit — bracket-quote everywhere; the C# property is `thirdparty_filenumber` with `[JsonPropertyName("3rdparty_filenumber")]`. Bracket-quote all 71 `Import_Update` columns. `special_instructions` and `unique_key` are `nvarchar(max)` — never in list queries. Deleting a `ProVestClient` hits FK 547 from `ProVestClientLocation` and `ProVestErrorLog`.
 
-**Target DB varies by connection string** → no hardcoded database name, two-part SP names (`dbo.X`), no `USE` statements.
+**Target DB varies by connection string** → no hardcoded database name, two-part object names (`dbo.X`), no `USE` statements.
 
 ---
 
@@ -81,7 +82,7 @@ a `sqlError` extension either way.
 
 ## 3. Search, filter, sort
 
-`search` = `LIKE '%term%'` OR'd across the listed columns. `filters` = exact match. `sort` = whitelist validated **inside the SP**.
+`search` = `LIKE '%term%'` OR'd across the listed columns. `filters` = exact match. `sort` = whitelist validated **in the service** (`ServiceBase.OrderBy`).
 
 | Table | Search | Filters | Sortable | Default |
 |---|---|---|---|---|
@@ -102,11 +103,10 @@ a `sqlError` extension either way.
 SQL lives in the service classes as `const` strings, one service per table. Every value is a
 Dapper parameter — nothing caller-supplied is ever concatenated into SQL.
 
-Four properties used to be enforced by the procedures and are now enforced in
-`Services/ServiceBase.cs`. They are worth naming individually, because in phase 1 this file is
-the only thing enforcing them:
+Five properties are enforced in `Services/ServiceBase.cs`. They are worth naming individually,
+because that file is the only thing enforcing them:
 
-| Property | Where it lives now |
+| Property | Where it lives |
 |---|---|
 | Values parameterised | Dapper, everywhere |
 | Sort whitelist | `ServiceBase.OrderBy` — see below |
@@ -136,72 +136,26 @@ return $"ORDER BY {column} {dir}, {tiebreaker}";
 ```
 
 Guard failures raise `RecordNotFoundException` / `RecordNotUniqueException` /
-`RecordIdInUseException`, which `SqlErrorMiddleware` maps to the same 404/409 responses the
-`THROW 51001/51002/51003` used to produce. The API contract is unchanged.
+`RecordIdInUseException`, which `SqlErrorMiddleware` maps to 404 and 409 responses.
 
-The 25 stored procedures that would replace all of this are written and kept in
-[`db/phase2-stored-procedures/`](../db/phase2-stored-procedures/).
+### Canonical search
 
-### Canonical search — phase 2 form, for reference
+`ClientService.SearchSql` is the pattern every list query follows — see
+[`ClientService.cs`](../src/ProVest.Admin.Api/Services/ClientService.cs). One `SELECT`, made of:
 
-The procedure below is the phase 2 equivalent of `ClientService.SearchSql`. The phase 1 query is
-the same text with `@SortBy`/`@SortDir` resolved in C# instead of a `CASE`-based `ORDER BY`.
+- each filter as `(@Param IS NULL OR col = @Param)`, so a single query text serves every
+  combination of filters rather than being assembled per request;
+- the free-text term as `LIKE @Term ESCAPE '\'` OR'd across the searchable columns, with the
+  metacharacters already escaped by `ServiceBase.SearchTerm`;
+- `COUNT(*) OVER () AS TotalCount`, which returns the pre-paging total in the same pass — no
+  second query, no `OUTPUT` parameter to thread through Dapper;
+- `ORDER BY` appended by `ServiceBase.OrderBy` from the whitelist, always with a tiebreaker;
+- `OFFSET/FETCH` from `ServiceBase.Paging`, which also carries `OPTION (RECOMPILE)`.
 
-```sql
-CREATE PROCEDURE [dbo].[usp_ProVestAdmin_Client_Search]
-    @Search         NVARCHAR(200) = NULL,
-    @IsActive       BIT           = NULL,
-    @ProjectSetupId INT           = NULL,
-    @SortBy         VARCHAR(50)   = 'ClientName',
-    @SortDir        VARCHAR(4)    = 'ASC',
-    @Page           INT           = 1,
-    @PageSize       INT           = 50
-AS
-BEGIN
-    SET NOCOUNT ON;
-
-    -- The SP is the last line of defence, not the API.
-    IF @Page < 1 SET @Page = 1;
-    IF @PageSize IS NULL OR @PageSize < 1 SET @PageSize = 50;
-    IF @PageSize > 100 SET @PageSize = 100;
-    IF @SortDir NOT IN ('ASC','DESC') SET @SortDir = 'ASC';
-    IF @SortBy NOT IN ('Id','ClientName','ClientCode','IsActive') SET @SortBy = 'ClientName';
-
-    -- LIKE metacharacters neutralised here so the API never has to.
-    DECLARE @Term NVARCHAR(210) = NULL;
-    IF @Search IS NOT NULL AND LTRIM(RTRIM(@Search)) <> ''
-        SET @Term = '%' + REPLACE(REPLACE(REPLACE(@Search,'\','\\'),'%','\%'),'_','\_') + '%';
-
-    SELECT
-        c.Id, c.ClientName, c.ClientCode, c.IsMergingEnabled, c.IsActive,
-        c.StateColumn, c.UniqueColumns, c.IsZipExtractionEnabled,
-        c.FileNumberColumn, c.ProjectSetupId,
-        COUNT(*) OVER () AS TotalCount
-    FROM dbo.ProVestClient c
-    WHERE (@IsActive       IS NULL OR c.IsActive = @IsActive)
-      AND (@ProjectSetupId IS NULL OR c.ProjectSetupId = @ProjectSetupId)
-      AND (@Term IS NULL OR
-              c.ClientName       LIKE @Term ESCAPE '\'
-           OR c.ClientCode       LIKE @Term ESCAPE '\'
-           OR c.StateColumn      LIKE @Term ESCAPE '\'
-           OR c.UniqueColumns    LIKE @Term ESCAPE '\'
-           OR c.FileNumberColumn LIKE @Term ESCAPE '\')
-    ORDER BY
-        CASE WHEN @SortDir='ASC'  AND @SortBy='ClientName' THEN c.ClientName END ASC,
-        CASE WHEN @SortDir='DESC' AND @SortBy='ClientName' THEN c.ClientName END DESC,
-        CASE WHEN @SortDir='ASC'  AND @SortBy='ClientCode' THEN c.ClientCode END ASC,
-        CASE WHEN @SortDir='DESC' AND @SortBy='ClientCode' THEN c.ClientCode END DESC,
-        CASE WHEN @SortDir='ASC'  AND @SortBy='IsActive'   THEN c.IsActive   END ASC,
-        CASE WHEN @SortDir='DESC' AND @SortBy='IsActive'   THEN c.IsActive   END DESC,
-        CASE WHEN @SortDir='DESC' AND @SortBy='Id'         THEN c.Id         END DESC,
-        c.Id ASC                                  -- default + tiebreaker
-    OFFSET (@Page - 1) * @PageSize ROWS
-    FETCH NEXT @PageSize ROWS ONLY
-    OPTION (RECOMPILE);
-END
-```
-
-`COUNT(*) OVER ()` returns the pre-paging total in one pass — no second query. `OPTION (RECOMPILE)` prevents the `(@Param IS NULL OR col = @Param)` pattern from caching one plan built for whichever parameter combination ran first. `InboundFolder`/`OutboundFolder` are `varchar(max)` and come from `_GetById`, not the list.
+`OPTION (RECOMPILE)` is there because the `(@Param IS NULL OR col = @Param)` pattern otherwise
+caches one plan built for whichever parameter combination happened to run first. `varchar(max)`
+and `nvarchar(max)` columns are deliberately absent from list queries — `InboundFolder` and
+`OutboundFolder` come from the GetById query instead.
 
 ### Canonical guarded write (no-PK tables)
 
@@ -305,12 +259,12 @@ RFC 7807 `ProblemDetails` with a field-level `errors` extension. Raw `SqlExcepti
 `OFFSET/FETCH` pagination, done properly, from the start:
 
 - Server-side pagination, search, and sort. The browser never receives more than one page.
-- `pageSize` default 50, max 100, **clamped in the SP** — not just the controller.
+- `pageSize` default 50, max 100, **clamped in the service** — not just the controller.
 - Deterministic sort tiebreaker on every query, or paging repeats and skips rows.
 - `COUNT(*) OVER ()` for the total, in the same pass as the page.
-- `OPTION (RECOMPILE)` on search SPs.
+- `OPTION (RECOMPILE)` on search queries.
 - No `nvarchar(max)` column in any list query.
-- List SPs return grid columns only — `Import_Update` returns ~11, not 71.
+- List queries return grid columns only — `Import_Update` returns ~11, not 71.
 - Search debounced 300 ms client-side.
 
 `Import_Update` and `ImportFileHeader` are unindexed heaps, so every query against them — including the write-path uniqueness guard — is a full scan. That's fine at current volume. If it stops being fine, four additive nonclustered indexes on `(id)` and `(client_id)` are the fix.
@@ -322,22 +276,21 @@ RFC 7807 `ProblemDetails` with a field-level `errors` extension. Raw `SqlExcepti
 ```
 UI-Provest/
 ├─ docs/
-├─ db/phase2-stored-procedures/  # 25 .sql + _deploy.sql, not deployed (see §4)
 └─ src/
    ├─ ProVest.Admin.Api/         # ASP.NET Core 8
-   │  ├─ Endpoints/
-   │  │  ├─ Clients/             # List, GetById, Create, Update, Deactivate
-   │  │  ├─ ClientLocations/
-   │  │  ├─ ColumnMappings/      # List, Regenerate
-   │  │  ├─ ImportUpdates/
-   │  │  ├─ ImportFileHeaders/
-   │  │  └─ Lookups/
+   │  ├─ Auth/                   # AuthOptions — accounts read from configuration
+   │  ├─ Controllers/            # one per resource, plus AuthController
+   │  │  ├─ ClientsController.cs
+   │  │  ├─ ClientLocationsController.cs
+   │  │  ├─ ColumnMappingsController.cs    # List, Regenerate
+   │  │  ├─ ImportUpdatesController.cs
+   │  │  ├─ ImportFileHeadersController.cs
+   │  │  └─ LookupsController.cs
    │  ├─ Contracts/              # request/response DTOs + validation, per table
-   │  ├─ Services/               # I*Service → Dapper → SP, per table
-   │  ├─ Data/                   # SqlConnectionFactory, SP name constants
-   │  ├─ Infrastructure/         # ProblemDetails middleware
-   │  └─ web.config              # ANCM v2, InProcess
-   └─ provest-admin-web/         # React 18 + TS + Vite
+   │  ├─ Services/               # I*Service → Dapper → inline SQL, per table
+   │  ├─ Data/                   # SqlConnectionFactory, generated SQL fragments
+   │  └─ Infrastructure/         # ProblemDetails middleware, audit log
+   └─ provest-admin-web/         # React 19 + TS + Vite
       └─ src/
          ├─ api/
          │  ├─ http.ts           # fetch wrapper + ProblemDetails parsing
@@ -355,6 +308,7 @@ UI-Provest/
          │  └─ ConfirmDialog.tsx
          ├─ hooks/useListState.ts   # page / pageSize / search / sort → query params
          ├─ pages/
+         │  ├─ LoginPage.tsx             # sign-in, the only anonymous page
          │  ├─ ClientsPage.tsx           ClientForm.tsx
          │  ├─ ClientLocationsPage.tsx   ClientLocationForm.tsx
          │  ├─ ColumnMappingsPage.tsx    # read-only, no form
@@ -406,10 +360,11 @@ the client can probe for a session on load.
 ### Data-layer controls
 
 1. **The application code is the only control.** With inline queries the app account needs
-   `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the five tables. The original design put enforcement in
-   the database — `GRANT EXECUTE` on 25 procedures and no table rights — so that a bug in the API
-   could not become a bug against the tables. **Phase 1 does not have that property.** It is the
-   deliberate trade for removing the deploy step, and reinstating it is the point of phase 2.
+   `SELECT`/`INSERT`/`UPDATE`/`DELETE` on the five tables, so a bug in the API is a bug against
+   the tables directly. The original design put enforcement in the database instead — `GRANT
+   EXECUTE` on stored procedures and no table rights — and that was traded away to remove the
+   deploy step. It is the one control on this list that cannot be expressed in C#, and the first
+   thing to ask for if this ever points at anything other than a dev database.
 2. No caller-supplied value is ever concatenated into SQL — everything is a Dapper parameter.
 3. `ORDER BY` is the one assembled fragment, and the request string is used only as a key into a
    fixed dictionary (§4). An unrecognised sort falls back to the default.
@@ -463,14 +418,15 @@ Only the HMR override is gated behind `--mode tunnel`, because `wss` on :443 is 
 the tunnel and wrong locally. Plain `npm run dev` works through ngrok; it just won't
 live-reload.
 
-**Worth being deliberate about:** the tunnel is a public URL, auth is disabled, and every write endpoint is live against the dev database. Anyone with the link can create, edit, and delete. Bring it up for the review, take it down after — don't leave it running.
+**Worth being deliberate about:** the tunnel is a public URL, the only thing in front of it is a shared list of plaintext passwords, and every write endpoint is live against the dev database. Anyone who gets past the sign-in page can create, edit, and delete. Bring it up for the review, take it down after — don't leave it running.
 
 ### IIS
 
 Deferred until the local review passes. It's a known shape — one site with the React build at `/` and the API as an application at `/api`, app pool on **No Managed Code**, ANCM v2 InProcess, URL Rewrite for SPA fallback, and a domain service account for the SQL connection. Details get worked out when we get there.
 
-Note that the app pool identity currently needs table-level rights (§8). Narrowing it to
-`EXECUTE`-only is phase 2 work, and worth doing before this is hosted anywhere shared.
+Note that the app pool identity needs table-level rights (§8). Narrowing it to `EXECUTE`-only
+would mean introducing stored procedures — new work, not a pending step, and worth raising before
+this is hosted anywhere shared.
 
 ---
 
@@ -488,21 +444,26 @@ Bulk edit · file/CSV import · CSV export · clone-an-importer · integrity/orp
 
 ## 12. Status
 
-Phase 1 is built. Both projects compile clean; **no SQL has been executed**, so the queries are
-unproven until they run against a real database.
+The application is built. Both projects compile clean; **no SQL has been executed**, so the
+queries are unproven until they run against a real database.
 
 | | |
 |---|---|
-| ✅ | API — services, contracts, 6 controllers, ProblemDetails middleware, Serilog audit |
+| ✅ | API — services, contracts, 7 controllers, ProblemDetails middleware, Serilog audit |
+| ✅ | Cookie sign-in with an authorization fallback policy (§8) |
 | ✅ | Shared frontend — `http.ts`, `DataGrid`, `Pagination`, `SearchBar`, `ErrorBanner`, `ConfirmDialog`, `useListState` |
 | ✅ | All five page/form pairs, including the 71-field grouped form |
-| ✅ | 25 stored procedures written, parked in `db/phase2-stored-procedures/` |
 | ⬜ | End-to-end test against the dev database |
 | ⬜ | Review over ngrok |
 | ⬜ | IIS |
 
-### Phase 2
+### Not planned
 
-- Move the queries into the parked stored procedures.
-- Narrow the app account to `EXECUTE`-only, no table rights — this is the security property phase 1 gives up (§8).
-- Revisit indexes on the two heaps if volume makes the full scans hurt (§6).
+Neither is started, and neither is a pending step — they come back as new requirements if wanted:
+
+- Stored procedures, with the app account narrowed to `EXECUTE`-only and no table rights. This is
+  the one security property the inline approach gives up (§8). A set of 25 was written against an
+  earlier revision of this design and removed unused; note that they encoded soft deletes via
+  `IsActive`, which §2 has since dropped, so a future set starts from the current CRUD matrix
+  rather than from those.
+- Indexes on the two heaps, if volume makes the full scans hurt (§6).
