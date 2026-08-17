@@ -1,0 +1,86 @@
+﻿CREATE OR ALTER PROCEDURE [dbo].[usp_ProVestAdmin_ImportUpdate_GetById]
+    @Id INT
+AS
+BEGIN
+    SET NOCOUNT ON;
+
+    -- A duplicated id cannot identify a single row, so the edit form must not
+    -- open on one. Not-found returns an empty set and the API maps that to 404.
+    IF (SELECT COUNT(*) FROM dbo.Import_Update WHERE id = @Id) > 1
+        THROW 51002, 'Import_Update.id is not unique; this row cannot be edited.', 1;
+
+    SELECT
+        iu.[id],
+        iu.[client_id],
+        iu.[lawfirm_filenumber],
+        iu.[3rdparty_filenumber] AS thirdparty_filenumber,
+        iu.[plaintiff],
+        iu.[plaintiff2],
+        iu.[defendant],
+        iu.[defendant2],
+        iu.[document_code],
+        iu.[document_type],
+        iu.[index_number],
+        iu.[court_name],
+        iu.[court_type],
+        iu.[court_county],
+        iu.[court_city],
+        iu.[court_state],
+        iu.[court_zip],
+        iu.[servee_last_name],
+        iu.[servee_name],
+        iu.[servee_address],
+        iu.[servee_apt],
+        iu.[servee_city],
+        iu.[servee_state],
+        iu.[servee_zip],
+        iu.[servee_last_name2],
+        iu.[servee_name2],
+        iu.[servee_address2],
+        iu.[servee_apt2],
+        iu.[servee_city2],
+        iu.[servee_state2],
+        iu.[servee_zip2],
+        iu.[employer_name],
+        iu.[employer_address1],
+        iu.[employer_address2],
+        iu.[employer_city],
+        iu.[employer_state],
+        iu.[employer_zip],
+        iu.[special_instructions],
+        iu.[additional_info1],
+        iu.[additional_info2],
+        iu.[additional_info3],
+        iu.[additional_info4],
+        iu.[additional_info5],
+        iu.[kasebilling_checknum],
+        iu.[kasebilling_amt],
+        iu.[date_kase_filed],
+        iu.[court_date],
+        iu.[court_time],
+        iu.[court_room],
+        iu.[date_due],
+        iu.[client_ref],
+        iu.[creditor],
+        iu.[chargeoff_date],
+        iu.[suit_amt],
+        iu.[principal],
+        iu.[interest],
+        iu.[court_cost],
+        iu.[atty_cost],
+        iu.[client_data1],
+        iu.[client_data2],
+        iu.[client_data3],
+        iu.[client_data4],
+        iu.[client_data5],
+        iu.[client_data6],
+        iu.[client_data7],
+        iu.[client_data8],
+        iu.[date_prepaid_check],
+        iu.[def_ordinal],
+        iu.[court_room2],
+        iu.[misc_1],
+        iu.[dob]
+    FROM dbo.Import_Update iu
+    WHERE iu.id = @Id;
+END

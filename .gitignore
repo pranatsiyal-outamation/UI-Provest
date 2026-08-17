@@ -1,0 +1,47 @@
+# .NET
+bin/
+obj/
+[Bb]in/
+[Oo]bj/
+publish/
+TestResults/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Publish profiles can embed server names and credentials
+*.pubxml
+*.pubxml.user
+*.publishsettings
+
+# Serilog output
+logs/
+*.log
+
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+*.tsbuildinfo
+npm-debug.log*
+yarn-error.log*
+
+# Local configuration. Holds the database server AND the sign-in passwords in
+# plaintext, so it must not be committed. appsettings.Development.example.json is
+# the template for setting up a new machine.
+src/ProVest.Admin.Api/appsettings.Development.json
+
+# Vite / local environment overrides
+.env
+.env.*
+!.env.example
+
+# Editors
+.vs/
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
