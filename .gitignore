@@ -28,10 +28,6 @@ coverage/
 npm-debug.log*
 yarn-error.log*
 
-# Local configuration. Holds the database server AND the sign-in passwords in
-# plaintext, so it must not be committed. appsettings.Development.example.json is
-# the template for setting up a new machine.
-src/ProVest.Admin.Api/appsettings.Development.json
 
 # Vite / local environment overrides
 .env
