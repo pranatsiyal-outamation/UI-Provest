@@ -4,6 +4,8 @@
  * and highlight the offending fields without each one parsing responses itself.
  */
 
+import { logger } from '../lib/logger'
+
 export interface ProblemDetails {
   type?: string
   title?: string
@@ -61,16 +63,26 @@ export function setUnauthenticatedHandler(handler: (() => void) | null) {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
-    ...init,
-    // The session cookie is same-origin (Vite proxies /api in dev, same site in
-    // production), but state this rather than relying on the default.
-    credentials: 'same-origin',
-    headers: {
-      'Content-Type': 'application/json',
-      ...(init?.headers ?? {}),
-    },
-  })
+  const method = init?.method ?? 'GET'
+  let response: Response
+
+  try {
+    response = await fetch(path, {
+      ...init,
+      // The session cookie is same-origin (Vite proxies /api in dev, same site in
+      // production), but state this rather than relying on the default.
+      credentials: 'same-origin',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(init?.headers ?? {}),
+      },
+    })
+  } catch (err) {
+    // fetch itself throws for network/CORS failures, before there's any response
+    // to build an ApiError from -- log it here or it vanishes into the caller.
+    logger.error(`${method} ${path} failed before a response was received`, err)
+    throw err
+  }
 
   if (!response.ok) {
     // A 401 on anything other than the session probe means the cookie expired
@@ -78,7 +90,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     if (response.status === 401 && !path.endsWith('/api/auth/me')) {
       onUnauthenticated?.()
     }
-    throw new ApiError(response.status, await readProblem(response))
+    const problem = await readProblem(response)
+    logger.error(`${method} ${path} responded ${response.status}`, problem)
+    throw new ApiError(response.status, problem)
   }
 
   if (response.status === 204) {

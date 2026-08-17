@@ -88,6 +88,11 @@ builder.Services.AddScoped<ILookupService, LookupService>();
 
 var app = builder.Build();
 
+// Serves the built React app (index.html, JS/CSS bundles) from wwwroot. Must run
+// before the API middleware below so asset requests never touch auth or logging.
+app.UseDefaultFiles();
+app.UseStaticFiles();
+
 // First in the pipeline so it catches everything downstream.
 app.UseMiddleware<SqlErrorMiddleware>();
 
@@ -116,5 +121,10 @@ app.UseAuthorization();
 // production the API is served from the same origin as the static files. That also
 // keeps the session cookie same-origin, so it needs no cross-site relaxation.
 app.MapControllers();
+
+// Any path that isn't an API route or a real static file falls back to the SPA
+// shell, so React Router can handle client-side routes like /clients on refresh.
+// Anonymous, or the fallback policy above would 401 before the login page can load.
+app.MapFallbackToFile("index.html").AllowAnonymous();
 
 app.Run();
